@@ -1,0 +1,292 @@
+import XCTest
+
+final class FlowUITests: XCTestCase {
+    enum Language: String {
+        case english = "en"
+        case german = "de"
+        case simplified = "zh-Hans"
+        case traditional = "zh-Hant"
+        case japanese = "ja"
+
+        var locale: String {
+            switch self {
+            case .english: return "en_US"
+            case .german: return "de_DE"
+            case .simplified: return "zh_CN"
+            case .traditional: return "zh_TW"
+            case .japanese: return "ja_JP"
+            }
+        }
+    }
+
+    private let app = XCUIApplication()
+
+    func testAAAWarmUpSimulator() {
+        XCTExpectFailure("云端模拟器首次启动可能超时", strict: false)
+        app.launch()
+        app.terminate()
+    }
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+    }
+
+    private func launch(_ flags: [String] = [], language: Language = .english, preset: String? = nil) {
+        if app.state != .notRunning { app.terminate() }
+        app.launchArguments = ["-ui-testing", "-reset", "-AppleLanguages", "(\(language.rawValue))",
+                               "-AppleLocale", language.locale] + flags
+        app.launchEnvironment = preset.map { ["UI_PRESET_CODE": $0] } ?? [:]
+        app.launch()
+    }
+
+    @discardableResult private func require(_ identifier: String, file: StaticString = #filePath,
+                                            line: UInt = #line) -> XCUIElement {
+        let element = app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+        XCTAssertTrue(element.waitForExistence(timeout: 10), identifier, file: file, line: line)
+        return element
+    }
+
+    private func tap(_ identifier: String, scroll: String? = nil, file: StaticString = #filePath, line: UInt = #line) {
+        let element = app.buttons[identifier]
+        if let scroll {
+            let view = app.scrollViews[scroll].firstMatch
+            for _ in 0..<3 {
+                if element.exists && element.isHittable { break }
+                if view.exists { view.swipeUp() }
+            }
+        }
+        let predicate = NSPredicate { _, _ in element.exists && element.isHittable && element.isEnabled }
+        let ready = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 10), .completed, identifier, file: file, line: line)
+        element.tap()
+    }
+
+    private func openStreet() {
+        tap("fixture.photo.0")
+        require("editor.counts")
+    }
+
+    private func drawManualCover() {
+        tap("editor.add")
+        let canvas = require("editor.canvas")
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.20, dy: 0.42))
+            .press(forDuration: 0.15, thenDragTo: canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.42, dy: 0.67)))
+    }
+
+    private func closeAlert() {
+        let ok = app.alerts.buttons["OK"].firstMatch
+        XCTAssertTrue(ok.waitForExistence(timeout: 8))
+        ok.tap()
+    }
+
+    func testFirstOpenToPreviewAndSaveInTwoAppTaps() {
+        launch()
+        require("home.title")
+        openStreet()
+        tap("editor.applyAll")
+        tap("editor.save")
+        require("export.saved")
+        tap("editor.back")
+        require("home.title")
+    }
+
+    func testZeroDetectionsCanDrawResizeRemoveUndoAndSave() {
+        launch()
+        tap("fixture.photo.1")
+        require("editor.zero")
+        drawManualCover()
+        tap("editor.grow", scroll: "editor.scroll")
+        tap("editor.remove", scroll: "editor.scroll")
+        require("editor.zero")
+        if !app.buttons["editor.undo"].isHittable { app.scrollViews["editor.scroll"].firstMatch.swipeDown() }
+        tap("editor.undo")
+        tap("editor.save")
+        require("export.saved")
+    }
+
+    func testUnavailableImageCanRetryAndManualScanFailureCanRecover() {
+        launch(["-recover"])
+        tap("fixture.failure")
+        require("editor.failure")
+        tap("editor.retry")
+        require("editor.counts")
+        tap("editor.applyAll")
+        tap("editor.save")
+        require("export.saved")
+
+        launch(["-scan-failure"])
+        tap("fixture.failure")
+        require("editor.failure")
+        tap("editor.manualReview")
+        require("editor.zero")
+        drawManualCover()
+        tap("editor.save")
+        require("export.saved")
+    }
+
+    func testLowStorageLeavesEditorAvailableForRetry() {
+        launch(["-no-space"])
+        openStreet()
+        tap("editor.applyAll")
+        tap("editor.save")
+        XCTAssertTrue(app.alerts.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "free space"))
+            .firstMatch.waitForExistence(timeout: 8))
+        closeAlert()
+        require("editor.save")
+        XCTAssertFalse(app.staticTexts["export.saved"].exists)
+    }
+
+    func testDeniedPhotosFallsBackToFilesInPNG() {
+        launch(["-denied"])
+        tap("home.files")
+        require("editor.counts")
+        tap("editor.applyAll")
+        tap("editor.save")
+        XCTAssertTrue(app.alerts.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "denied"))
+            .firstMatch.waitForExistence(timeout: 8))
+        closeAlert()
+        tap("editor.export")
+        tap("export.format.png")
+        tap("export.files")
+        require("share.requested")
+        require("export.saved")
+    }
+
+    func testBatchAppliesOnlyToExplicitLayoutTargetsAndExportsOnlyConfirmed() {
+        launch()
+        tap("home.multi")
+        require("batch.title")
+        tap("batch.applyAll")
+        XCTAssertFalse(app.buttons["batch.save"].isEnabled)
+        tap("batch.item.1")
+        require("editor.canvas")
+        drawManualCover()
+        tap("editor.copyFrame", scroll: "editor.scroll")
+        require("editor.layoutTarget.3").tap()
+        XCTAssertFalse(app.switches["editor.layoutTarget.2"].exists)
+        tap("editor.confirmLayout")
+        require("editor.templateResult")
+        app.scrollViews["editor.scroll"].firstMatch.swipeDown()
+        tap("editor.confirm")
+        tap("batch.filter.confirmed")
+        require("batch.item.1")
+        XCTAssertFalse(app.buttons["batch.item.3"].exists)
+        tap("batch.save")
+        require("export.saved")
+        XCTAssertTrue(app.buttons["batch.item.1"].label.contains("Saved"))
+    }
+
+    func testPresetCodeAndFilePreviewDoNotApplyUntilChosen() throws {
+        let body = #"{"version":1,"rules":[{"kind":"face","style":"solid","strength":90,"sticker":0}],"positions":[]}"#
+        let token = Data(body.utf8).base64EncodedString().replacingOccurrences(of: "=", with: "")
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+        launch(preset: "\nPX1:\(token)\n")
+        tap("home.settings")
+        tap("preset.preview")
+        require("preset.saveImported")
+        tap("preset.cancelImport")
+        tap("preset.importFile")
+        tap("preset.saveImported")
+        require("preset.feedback")
+        tap("preset.item.0", scroll: "settings.scroll")
+        tap("preset.copy.0", scroll: "settings.scroll")
+        tap("preset.file.0", scroll: "settings.scroll")
+        require("share.requested")
+    }
+
+    func testHomePresetShortcutsPreviewBeforeSaving() {
+        let body = #"{"version":1,"rules":[{"kind":"face","style":"solid","strength":90,"sticker":0}],"positions":[]}"#
+        let token = Data(body.utf8).base64EncodedString().replacingOccurrences(of: "=", with: "")
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+        launch(preset: "PX1:\(token)")
+        tap("home.importPreset")
+        tap("preset.paste", scroll: "settings.scroll")
+        require("preset.saveImported")
+        tap("preset.cancelImport")
+        XCTAssertFalse(app.buttons["preset.item.0"].exists)
+        tap("settings.back")
+        tap("home.importPresetFile")
+        require("preset.saveImported")
+        tap("preset.saveImported")
+        require("preset.feedback")
+        require("preset.item.0")
+    }
+
+    func testSinglePhotoDeliveryShortcutsReachSystemHandoffAfterRedaction() {
+        for action in ["editor.shareClean", "editor.shareCard", "editor.files"] {
+            launch()
+            openStreet()
+            XCTAssertFalse(app.buttons[action].exists)
+            tap("editor.applyAll")
+            tap(action, scroll: "editor.scroll")
+            require("share.requested")
+            if action == "editor.files" { require("export.saved") }
+        }
+    }
+
+    func testShareVersionAndMilestoneUseTestSignalsWithoutShowingSystemShare() {
+        launch(["-milestone"])
+        openStreet()
+        tap("editor.applyAll")
+        tap("editor.save")
+        tap("editor.export")
+        tap("export.makeCard")
+        require("share.badge")
+        tap("export.shareCard")
+        if !app.descendants(matching: .any).matching(identifier: "share.requested").firstMatch.waitForExistence(timeout: 6) {
+            tap("export.shareCard")
+        }
+        require("share.requested")
+        tap("export.cleanOptions")
+        tap("export.milestone", scroll: "export.scroll")
+        require("milestone.title")
+        tap("milestone.share")
+        require("share.requested")
+    }
+
+    func testStoreScreenshotsEnglish() { storeShots(.english) }
+    func testStoreScreenshotsGerman() { storeShots(.german) }
+    func testStoreScreenshotsSimplifiedChinese() { storeShots(.simplified) }
+    func testStoreScreenshotsTraditionalChinese() { storeShots(.traditional) }
+    func testStoreScreenshotsJapanese() { storeShots(.japanese) }
+
+    private func storeShots(_ language: Language) {
+        launch(language: language)
+        require("fixture.photo.0")
+        let prefix = "store-" + language.rawValue + "-"
+        shot(prefix + "01-home")
+        openStreet()
+        shot(prefix + "02-detections")
+        tap("editor.applyAll")
+        let save = app.buttons["editor.save"]
+        let stable = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in save.exists && save.isEnabled }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [stable], timeout: 10), .completed)
+        shot(prefix + "03-redacted")
+        tap("editor.export")
+        require("export.format.jpg")
+        shot(prefix + "05-export")
+
+        launch(language: language)
+        tap("home.multi")
+        tap("batch.applyAll")
+        tap("batch.item.0")
+        tap("editor.confirm")
+        require("batch.title")
+        require("batch.save")
+        shot(prefix + "04-batch")
+    }
+
+    private func shot(_ name: String) {
+        let screenshot = app.screenshot()
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let environment = ProcessInfo.processInfo.environment
+        if let path = environment["SHOTS_DIR"] ?? environment["TEST_RUNNER_SHOTS_DIR"] {
+            let folder = URL(fileURLWithPath: path, isDirectory: true)
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try? screenshot.pngRepresentation.write(to: folder.appendingPathComponent(name + ".png"))
+        }
+    }
+}
